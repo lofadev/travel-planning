@@ -1,6 +1,12 @@
 from langgraph.graph import StateGraph, END
 from src.state import TravelState
-from src.node import ask_for_info, check_info, parse_input, search_info, generate_itinerary
+from src.node import (
+    ask_for_info,
+    check_info,
+    parse_input,
+    search_info,
+    generate_itinerary,
+)
 
 # Xây dựng graph
 workflow = StateGraph(TravelState)
@@ -15,10 +21,7 @@ workflow.add_node("generate_itinerary", generate_itinerary)
 workflow.add_conditional_edges(
     "parse_input",
     check_info,
-    {
-        "search_info": "search_info",
-        "ask_for_info": "ask_for_info"
-    }
+    {"search_info": "search_info", "ask_for_info": "ask_for_info"},
 )
 workflow.add_edge("ask_for_info", END)  # End với message hỏi
 workflow.add_edge("search_info", "generate_itinerary")

@@ -1,11 +1,12 @@
 import json
 import os
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from langchain_core.messages import AIMessage
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
 from langchain_openai import ChatOpenAI
-from langchain_tavily import TavilySearch
+from tavily import TavilyClient
 
+from src.prompt import ask_prompt, extract_prompt, generate_prompt
 from src.state import TravelState
 
 from dotenv import load_dotenv
@@ -13,56 +14,40 @@ from dotenv import load_dotenv
 load_dotenv()
 
 MODEL = os.getenv("OPENAI_MODEL")
-# Khởi tạo LLM (sử dụng OpenAI, thay đổi nếu cần)
-llm = ChatOpenAI(model=MODEL, temperature=0.1)  # Giảm temperature để tăng tốc độ
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
-# LLM với streaming cho generate_itinerary
-streaming_llm = ChatOpenAI(model=MODEL, temperature=0.1, streaming=True)
+llm = ChatOpenAI(model=MODEL, temperature=0.1)
+fast_llm = ChatOpenAI(model=MODEL, temperature=0)
 
-# Tool Tavily Search (tối đa 10 kết quả mỗi query)
-tavily_tool = TavilySearch(max_results=10)
+tavily_tool = TavilyClient(api_key=TAVILY_API_KEY)
 
 
-# Node 1: Parse input để trích xuất thông tin từ yêu cầu tiếng Việt
+# Node: Parse input to extract info from Vietnamese request
 def parse_input(state: TravelState) -> dict:
-    input_text = state["messages"][-1].content  # Lấy message cuối cùng là input từ user
-    
-    # Lấy thông tin đã trích xuất trước đó (nếu có)
+    # get the last message which is the input from user
+    input_text = state["messages"][-1].content
+
+    # get the extracted info before (if any)
     previous_info = state.get("extracted_info", {})
-    
-    # Tạo context từ thông tin cũ để AI hiểu ngữ cảnh
+
+    # create context from old info to help AI understand the context
     context_info = ""
     if previous_info:
         context_info = f"Thông tin đã biết trước đó: {json.dumps(previous_info, ensure_ascii=False)}\n"
 
-    # Prompt để trích xuất thông tin bằng tiếng Việt
-    extract_prompt = ChatPromptTemplate.from_messages(
-        [
-            SystemMessage(
-                content="Bạn là chuyên gia phân tích yêu cầu du lịch. "
-                "Trích xuất các thông tin sau từ văn bản tiếng Việt, trả về dưới dạng JSON: "
-                "destination (địa điểm), duration (số ngày, ví dụ: '3 ngày 2 đêm'), "
-                "people_count (số người đi, ví dụ: 2 hoặc 4), "
-                "preferences (danh sách sở thích, ví dụ: ['cà phê chill', 'chụp ảnh thiên nhiên']), "
-                "budget (ngân sách, ví dụ: 'tầm trung'), constraints (ràng buộc, ví dụ: ['không đi bộ nhiều']). "
-                "Nếu không có thông tin trong tin nhắn hiện tại, để null cho field đó. "
-                "LƯU Ý: Hãy xem xét thông tin đã biết trước đó để hiểu ngữ cảnh."
-            ),
-            HumanMessage(content=f"{context_info}Tin nhắn hiện tại: {input_text}"),
-        ]
-    )
+    extracted_prompt = extract_prompt(context_info, input_text)
 
     parser = JsonOutputParser()
-    chain = extract_prompt | llm | parser
+    chain = extracted_prompt | fast_llm | parser
     new_extracted = chain.invoke({})
-    
-    # Merge thông tin cũ với thông tin mới (ưu tiên thông tin mới nếu không null)
+
+    # Merge old info with new info (prioritize new info if not null)
     final_extracted = previous_info.copy() if previous_info else {}
     for key, value in new_extracted.items():
         if value is not None:
             final_extracted[key] = value
-
-    # Thêm message về kết quả trích xuất vào lịch sử
+    #
+    # add message about the extracted info to the history
     return {
         "extracted_info": final_extracted,
         "messages": [
@@ -73,118 +58,157 @@ def parse_input(state: TravelState) -> dict:
     }
 
 
-# Conditional edge: Kiểm tra nếu đủ info (destination, duration, people_count không null)
+# Conditional edge: (destination, departure_location, duration, people_count)
 def check_info(state: TravelState) -> str:
     extracted = state["extracted_info"]
-    required_fields = ["destination", "duration", "people_count"]
-    
-    # Kiểm tra xem có đủ thông tin cần thiết không
+    required_fields = ["destination", "departure_location", "duration", "people_count"]
+
+    # check if all required fields are present
     has_all_required = all(extracted.get(field) for field in required_fields)
-    
+
     if has_all_required:
         return "search_info"
     else:
         return "ask_for_info"
 
-# Node: Hỏi lại nếu thiếu info
+
+# Node: ask again if missing info
 def ask_for_info(state: TravelState) -> dict:
     extracted = state["extracted_info"]
     missing = []
     if not extracted.get("destination"):
         missing.append("điểm đến du lịch")
+    if not extracted.get("departure_location"):
+        missing.append("địa điểm xuất phát")
     if not extracted.get("duration"):
         missing.append("số ngày đi (ví dụ: 3 ngày 2 đêm)")
     if not extracted.get("people_count"):
         missing.append("số người đi")
-    
-    # Prompt để generate câu hỏi thông minh, lịch sự bằng tiếng Việt
-    ask_prompt = ChatPromptTemplate.from_messages([
-        SystemMessage(content="Bạn là trợ lý du lịch thân thiện. Dựa trên thông tin đã có, hãy hỏi lại người dùng về các thông tin thiếu một cách thông minh và lịch sự. "
-                              "Chỉ hỏi về những gì thiếu, và gợi ý nếu cần. Trả về chỉ câu hỏi dưới dạng text đơn giản."),
-        HumanMessage(content=f"Thông tin thiếu: {', '.join(missing)}. Thông tin hiện có: {json.dumps(extracted, ensure_ascii=False)}")
-    ])
-    
-    parser = StrOutputParser()
-    chain = ask_prompt | llm | parser
-    question = chain.invoke({})
-    
-    return {
-        "itinerary": question,  # Sử dụng itinerary để lưu message hỏi lại làm output
-        "messages": [AIMessage(content=question)]
-    }
 
-# Node 2: Tìm kiếm thông tin sử dụng Tavily tool
+    asked_prompt = ask_prompt(missing, extracted)
+
+    parser = StrOutputParser()
+    chain = asked_prompt | llm | parser
+    question = chain.invoke({})
+
+    return {"itinerary": question}
+
+
+# Helper function to perform a single search
+def perform_single_search(query_info):
+    query, query_type = query_info
+    try:
+        result = tavily_tool.search(
+            query=query,
+            max_results=5,  # increase to 5 for more comprehensive results
+            include_answer=True,
+            # include_raw_content=True,  # include full content for detailed information
+            country="vietnam",
+            time_range="year",
+            # search_depth="advanced",  # use advanced search for more thorough results
+        )
+        return {"query": query, "query_type": query_type, "results": result}
+    except Exception as e:
+        return {"query": query, "query_type": query_type, "results": {"error": str(e)}}
+
+
+# Node 2: search info using Tavily tool with parallel queries
 def search_info(state: TravelState) -> dict:
     extracted = state["extracted_info"]
-    destination = extracted.get("destination", "unknown")
-    budget = extracted.get("budget", "tầm trung")
-    duration = extracted.get("duration", "unknown")
-    people_count = extracted.get("people_count", "unknown")
+    destination = extracted.get("destination", "")
+    departure_location = extracted.get("departure_location", "")
+    people_count = extracted.get("people_count", "")
 
-    # Tạo preferences string từ sở thích người dùng
+    # create preferences string from user's preferences
     preferences_str = ""
     if extracted.get("preferences"):
         preferences_str = " ".join(extracted["preferences"])
-    
-    # Tạo 1 query tổng quát nhưng bao quát - tập trung vào 3 yếu tố chính
-    comprehensive_query = (
-        f"Du lịch {destination} {duration} cho {people_count} người ngân sách {budget}: "
-        f"nhà hàng quán ăn địa phương giá cả, khách sạn homestay chỗ nghỉ giá tốt, "
-        f"chi phí ước tính chi tiết ăn ở di chuyển {preferences_str}"
-    )
 
-    # Thực hiện search với query tổng hợp
-    result = tavily_tool.invoke({
-        "query": comprehensive_query,
-    })
-    
-    search_results = [{"query": comprehensive_query, "results": result}]
+    # make queries for each type of information
+    queries = [
+        # Query 1: Accommodation with detailed information
+        (
+            f"Khách sạn homestay resort chỗ nghỉ tốt ở {destination} cho {people_count} người {preferences_str}",
+            "accommodation",
+        ),
+        # Query 2: Dining with specific restaurant details
+        (
+            f"Nhà hàng quán ăn ngon ở {destination} cho {people_count} người {preferences_str}",
+            "dining",
+        ),
+        # Query 3: Attractions with complete address information
+        (
+            f"Địa điểm tham quan du lịch vui chơi giải trí ở {destination}, {preferences_str}",
+            "attractions",
+        ),
+        # Query 4: Transportation with detailed cost and schedule
+        (
+            f"Phương tiện di chuyển từ {departure_location} đến {destination} cho"
+            f"{people_count} người {preferences_str}",
+            "transportation",
+        ),
+    ]
 
-    # Thêm message về kết quả search
-    summary = f"Đã tìm kiếm thông tin tổng hợp cho {destination}, thu được {len(result)} kết quả về ăn uống, chỗ nghỉ và giá cả."
-    return {"search_results": search_results, "messages": [AIMessage(content=summary)]}
+    # perform all queries in parallel
+    search_results = []
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        # submit all searches
+        future_to_query = {
+            executor.submit(perform_single_search, query_info): query_info
+            for query_info in queries
+        }
+
+        # collect results as they complete
+        for future in as_completed(future_to_query):
+            try:
+                result = future.result()
+                search_results.append(result)
+            except Exception as e:
+                query_info = future_to_query[future]
+                print(f"Exception occurred for {query_info[1]}: {e}")
+                search_results.append(
+                    {
+                        "query": query_info[0],
+                        "query_type": query_info[1],
+                        "results": {"error": str(e)},
+                    }
+                )
+
+    return {
+        "search_results": search_results,
+    }
 
 
-# Node 3: Generate itinerary dựa trên tất cả thông tin
+# Node 3: Generate itinerary based on all information
 def generate_itinerary(state: TravelState) -> dict:
     extracted = state["extracted_info"]
     searches = state["search_results"]
 
-    # Chuẩn bị context từ searches
-    search_summary = "\n".join(
-        [
-            f"Query: {s['query']}\nResults: {json.dumps(s['results'], ensure_ascii=False)}"
-            for s in searches
-        ]
-    )
+    # prepare context from searches with improved formatting for different query types
+    search_summary_parts = []
+    for s in searches:
+        query_type = s.get("query_type", "general")
+        query_type_vietnamese = {
+            "accommodation": "Chỗ nghỉ",
+            "dining": "Ăn uống",
+            "attractions": "Tham quan/Vui chơi",
+            "transportation": "Di chuyển/Chi phí",
+            "general": "Tổng quát",
+        }.get(query_type, query_type)
 
-    # Prompt để generate lịch trình Markdown tập trung vào 3 yếu tố chính
-    generate_prompt = ChatPromptTemplate.from_messages(
-        [
-            SystemMessage(
-                content="Tạo lịch trình du lịch Markdown. Mỗi ngày gồm 4 phần: Schedule, Transportation, Dining, Cost. "
-                "Ví dụ:\n## Ngày 1: Khám phá trung tâm\n### 📅 Schedule\n- 8:00 - Ăn sáng\n- 9:00 - Tham quan\n"
-                "### 🚗 Transportation\n- Taxi: 50k\n### 🍽️ Dining\n- Sáng: Phở - 50k\n"
-                "### 💰 Cost\n- Tổng: 100k VNĐ\n\nKết thúc bằng tổng hợp chi phí toàn bộ."
-            ),
-            MessagesPlaceholder(variable_name="messages"),
-            HumanMessage(
-                content=f"Địa điểm: {extracted.get('destination')}, Thời gian: {extracted.get('duration')}, "
-                f"Số người: {extracted.get('people_count')}, Ngân sách: {extracted.get('budget', 'tầm trung')}\n\n"
-                f"{search_summary.strip()}"
-            ),
-        ]
-    )
+        search_summary_parts.append(
+            f"=== {query_type_vietnamese.upper()} ===\n"
+            f"Results: {json.dumps(s['results'], ensure_ascii=False)}\n"
+        )
+
+    search_summary = "\n".join(search_summary_parts)
+    print("search_summary", search_summary)
+
+    generated_prompt = generate_prompt(extracted, search_summary)
 
     parser = StrOutputParser()
-    chain = generate_prompt | streaming_llm | parser
-    
-    # Sử dụng streaming để tăng tốc độ perceived
-    itinerary_md = ""
-    for chunk in chain.stream({"messages": state["messages"]}):
-        itinerary_md += chunk
+    chain = generated_prompt | llm | parser
 
-    return {
-        "itinerary": itinerary_md,
-        "messages": [AIMessage(content="Đã tạo lịch trình hoàn chỉnh.")],
-    }
+    itinerary_md = chain.invoke({"messages": state["messages"][-5:][::-1]})
+
+    return {"itinerary": itinerary_md}
