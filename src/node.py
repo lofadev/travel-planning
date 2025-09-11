@@ -17,7 +17,6 @@ MODEL = os.getenv("OPENAI_MODEL")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 llm = ChatOpenAI(model=MODEL, temperature=0.1)
-fast_llm = ChatOpenAI(model=MODEL, temperature=0)
 
 tavily_tool = TavilyClient(api_key=TAVILY_API_KEY)
 
@@ -38,7 +37,7 @@ def parse_input(state: TravelState) -> dict:
     extracted_prompt = extract_prompt(context_info, input_text)
 
     parser = JsonOutputParser()
-    chain = extracted_prompt | fast_llm | parser
+    chain = extracted_prompt | llm | parser
     new_extracted = chain.invoke({})
 
     # Merge old info with new info (prioritize new info if not null)
@@ -124,16 +123,20 @@ def search_info(state: TravelState) -> dict:
     if extracted.get("preferences"):
         preferences_str = " ".join(extracted["preferences"])
 
+    transports_str = ""
+    if extracted.get("transports"):
+        transports_str = " ".join(extracted["transports"])
+
     # make queries for each type of information
     queries = [
         # Query 1: Accommodation with detailed information
         (
-            f"Khách sạn homestay resort chỗ nghỉ tốt ở {destination} cho {people_count} người {preferences_str}",
+            f"Khách sạn homestay resort chỗ nghỉ tốt ở {destination} cho {people_count} người",
             "accommodation",
         ),
         # Query 2: Dining with specific restaurant details
         (
-            f"Nhà hàng quán ăn ngon ở {destination} cho {people_count} người {preferences_str}",
+            f"Nhà hàng quán ăn ngon ở {destination} cho {people_count} người",
             "dining",
         ),
         # Query 3: Attractions with complete address information
@@ -143,8 +146,8 @@ def search_info(state: TravelState) -> dict:
         ),
         # Query 4: Transportation with detailed cost and schedule
         (
-            f"Phương tiện di chuyển từ {departure_location} đến {destination} cho"
-            f"{people_count} người {preferences_str}",
+            f"Phương tiện di chuyển bằng {transports_str} từ {departure_location} đến {destination} cho "
+            f"{people_count} người",
             "transportation",
         ),
     ]
